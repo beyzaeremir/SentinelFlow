@@ -5,150 +5,133 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
-app = FastAPI(
-    title="SentinelFlow Gateway & Dashboard",
-    description="FinOps Semantic Cache, Güvenlik Guardrails, HITL ve Canlı Yönetim Paneli",
-    version="1.1.0"
-)
+app = FastAPI(title="SentinelFlow Gateway", version="1.1.0")
 
-# 1. Model ve Veritabanı
-print(">>> SentinelFlow Model Yükleniyor...")
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
-ONBELLEK = [
+CACHE_STORE = [
     {
-        "soru": "yıllık izin süresi kaç gündür",
-        "cevap": "1. yılını dolduran çalışanların yıllık izin hakkı 14 gündür."
+        "query": "yıllık izin süresi kaç gündür",
+        "response": "1. yılını dolduran çalışanların yıllık izin hakkı 14 gündür."
     },
     {
-        "soru": "fatura onay süreci nasıl işler",
-        "cevap": "50.000 TL altı harcamalar sistem tarafından otomatik onaylanır, üzeri yönetici onayına gider."
+        "query": "fatura onay süreci nasıl işler",
+        "response": "50.000 TL altı harcamalar sistem tarafından otomatik onaylanır, üzeri yönetici onayına gider."
     }
 ]
 
-kayitli_sorular = [item["soru"] for item in ONBELLEK]
-kayitli_vektorler = model.encode(kayitli_sorular, normalize_embeddings=True)
+cached_queries = [item["query"] for item in CACHE_STORE]
+cached_embeddings = model.encode(cached_queries, normalize_embeddings=True)
 
-# 2. Kurallar ve Havuzlar
-BENZERLIK_ESIGI = 0.70
-HITL_LIMITI = 50000.0
-LLM_SORGUSU_MALIYETI = 0.02
+SIMILARITY_THRESHOLD = 0.70
+HITL_SPENDING_LIMIT = 50000.0
+LLM_QUERY_COST = 0.02
 
-metrikler = {
-    "toplam_istek": 0,
-    "onbellek_isabeti": 0,
-    "llm_yonlendirme": 0,
-    "engellenen_saldiri": 0,
-    "hitl_kuyrugu": 0,
-    "toplam_tasarruf_dolar": 0.0
+metrics = {
+    "total_requests": 0,
+    "cache_hits": 0,
+    "llm_routes": 0,
+    "blocked_attacks": 0,
+    "hitl_queue": 0,
+    "total_savings_usd": 0.0
 }
 
-# HITL ve İşlem Geçmişi Havuzu
-islem_gecmisi = []
+audit_log = []
 
-# 3. Şemalar
-class IstekModeli(BaseModel):
+class QueryRequest(BaseModel):
     soru: str
 
-class YanitModeli(BaseModel):
+class GatewayResponse(BaseModel):
     durum: str
     islem_turu: str
     yanit: str
     anlamsal_benzerlik: float | None = None
     islem_maliyeti: str
 
-# 4. Mantık Fonksiyonları
-def guvenlik_kontrolu(metin: str) -> tuple[bool, str]:
-    kaliplar = [
+def validate_prompt_safety(text: str) -> tuple[bool, str]:
+    blocked_patterns = [
         r"ignore.*previous.*instructions",
         r"önceki.*talimatları.*unut",
         r"şifreleri.*göster",
         r"drop\s+table"
     ]
-    for kalip in kaliplar:
-        if re.search(kalip, metin, re.IGNORECASE):
-            return False, f"Zararlı komut tespit edildi: '{kalip}'"
-    return True, "Temiz"
+    for pattern in blocked_patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return False, f"Zararlı komut tespit edildi: '{pattern}'"
+    return True, "OK"
 
-def hitl_harcama_kontrolu(metin: str) -> tuple[bool, float, str]:
-    eslesme = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:tl|bin\s*tl)", metin, re.IGNORECASE)
-    if eslesme:
-        deger_str = eslesme.group(1).replace(".", "").replace(",", ".")
-        tutar = float(deger_str)
-        if "bin" in metin.lower() and tutar < 1000:
-            tutar *= 1000
-        if tutar > HITL_LIMITI:
-            return True, tutar, f"Harcama limiti aşıldı ({tutar:,.2f} TL > {HITL_LIMITI:,.2f} TL)."
-        return False, tutar, f"Limit dahilinde ({tutar:,.2f} TL)."
-    return False, 0.0, "Tutar yok"
+def evaluate_hitl_threshold(text: str) -> tuple[bool, float, str]:
+    match = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:tl|bin\s*tl)", text, re.IGNORECASE)
+    if match:
+        amount = float(match.group(1).replace(".", "").replace(",", "."))
+        if "bin" in text.lower() and amount < 1000:
+            amount *= 1000
+        if amount > HITL_SPENDING_LIMIT:
+            return True, amount, f"Harcama limiti aşıldı ({amount:,.2f} TL > {HITL_SPENDING_LIMIT:,.2f} TL)."
+        return False, amount, f"Limit dahilinde ({amount:,.2f} TL)."
+    return False, 0.0, "N/A"
 
-# 5. Uç Noktalar
-@app.post("/v1/chat", response_model=YanitModeli)
-def chat_gateway(istek: IstekModeli):
-    metrikler["toplam_istek"] += 1
-    soru = istek.soru
+@app.post("/v1/chat", response_model=GatewayResponse)
+def handle_chat_gateway(request: QueryRequest):
+    metrics["total_requests"] += 1
+    query = request.soru
 
-    # 1. Güvenlik
-    guvenli, guvenlik_notu = guvenlik_kontrolu(soru)
-    if not guvenli:
-        metrikler["engellenen_saldiri"] += 1
-        islem_gecmisi.insert(0, {"soru": soru, "tur": "GÜVENLİK ENGELİ", "durum": "ENGELLENDİ", "maliyet": "$0.00"})
-        raise HTTPException(status_code=400, detail={"hata": "Güvenlik Engeli", "mesaj": guvenlik_notu})
+    is_safe, safety_message = validate_prompt_safety(query)
+    if not is_safe:
+        metrics["blocked_attacks"] += 1
+        audit_log.insert(0, {"query": query, "type": "GÜVENLİK ENGELİ", "cost": "$0.00"})
+        raise HTTPException(status_code=400, detail={"hata": "Güvenlik Engeli", "mesaj": safety_message})
 
-    # 2. HITL
-    hitl_gerekli, tutar, hitl_mesaji = hitl_harcama_kontrolu(soru)
-    if hitl_gerekli:
-        metrikler["hitl_kuyrugu"] += 1
-        islem_gecmisi.insert(0, {"soru": soru, "tur": "HITL KUYRUĞU", "durum": "ONAY BEKLİYOR", "maliyet": "$0.00"})
-        return YanitModeli(
+    requires_hitl, _, hitl_message = evaluate_hitl_threshold(query)
+    if requires_hitl:
+        metrics["hitl_queue"] += 1
+        audit_log.insert(0, {"query": query, "type": "HITL KUYRUĞU", "cost": "$0.00"})
+        return GatewayResponse(
             durum="ONAY_BEKLENIYOR",
             islem_turu="HITL_KUYRUĞU",
-            yanit=f"{hitl_mesaji} Talep Finans Direktörü onayına iletildi.",
+            yanit=f"{hitl_message} Talep Finans Direktörü onayına iletildi.",
             islem_maliyeti="$0.00"
         )
 
-    # 3. Semantik Önbellek
-    soru_vektoru = model.encode(soru, normalize_embeddings=True)
-    skorlar = np.dot(kayitli_vektorler, soru_vektoru)
-    en_iyi_indeks = int(np.argmax(skorlar))
-    en_iyi_skor = float(skorlar[en_iyi_indeks])
+    query_embedding = model.encode(query, normalize_embeddings=True)
+    similarity_scores = np.dot(cached_embeddings, query_embedding)
+    top_index = int(np.argmax(similarity_scores))
+    top_score = float(similarity_scores[top_index])
 
-    if en_iyi_skor >= BENZERLIK_ESIGI:
-        metrikler["onbellek_isabeti"] += 1
-        metrikler["toplam_tasarruf_dolar"] += LLM_SORGUSU_MALIYETI
-        islem_gecmisi.insert(0, {"soru": soru, "tur": "CACHE HIT", "durum": "BAŞARILI", "maliyet": "$0.00"})
-        return YanitModeli(
+    if top_score >= SIMILARITY_THRESHOLD:
+        metrics["cache_hits"] += 1
+        metrics["total_savings_usd"] += LLM_QUERY_COST
+        audit_log.insert(0, {"query": query, "type": "CACHE HIT", "cost": "$0.00"})
+        return GatewayResponse(
             durum="BASARILI",
             islem_turu="CACHE_HIT",
-            yanit=ONBELLEK[en_iyi_indeks]["cevap"],
-            anlamsal_benzerlik=round(en_iyi_skor, 4),
+            yanit=CACHE_STORE[top_index]["response"],
+            anlamsal_benzerlik=round(top_score, 4),
             islem_maliyeti="$0.00"
         )
 
-    # 4. Cache Miss / LLM
-    metrikler["llm_yonlendirme"] += 1
-    islem_gecmisi.insert(0, {"soru": soru, "tur": "CACHE MISS (LLM)", "durum": "BAŞARILI", "maliyet": f"${LLM_SORGUSU_MALIYETI}"})
-    return YanitModeli(
+    metrics["llm_routes"] += 1
+    audit_log.insert(0, {"query": query, "type": "CACHE MISS (LLM)", "cost": f"${LLM_QUERY_COST}"})
+    return GatewayResponse(
         durum="BASARILI",
         islem_turu="CACHE_MISS_LLM_CAGRISI",
-        yanit=f"LLM Yanıtı: '{soru}' sorusu için harici model çalıştırıldı.",
-        anlamsal_benzerlik=round(en_iyi_skor, 4),
-        islem_maliyeti=f"${LLM_SORGUSU_MALIYETI}"
+        yanit=f"LLM Yanıtı: '{query}' sorusu için harici model çalıştırıldı.",
+        anlamsal_benzerlik=round(top_score, 4),
+        islem_maliyeti=f"${LLM_QUERY_COST}"
     )
 
 @app.get("/v1/metrics")
 def get_metrics():
-    return {"metrikler": metrikler, "gecmis": islem_gecmisi}
+    return {"metrics": metrics, "audit_log": audit_log}
 
-# 6. Web Dashboard (HTML/CSS)
 @app.get("/", response_class=HTMLResponse)
-def dashboard():
+def render_dashboard():
     return """
     <!DOCTYPE html>
     <html lang="tr">
     <head>
         <meta charset="UTF-8">
-        <title>SentinelFlow Gateway Dashboard</title>
+        <title>SentinelFlow Gateway</title>
         <style>
             :root {
                 --bg: #0f172a;
@@ -175,8 +158,8 @@ def dashboard():
                 padding-bottom: 20px;
                 margin-bottom: 30px;
             }
-            .header h1 { margin: 0; font-size: 26px; }
-            .header span { color: var(--accent); font-size: 14px; font-weight: 600; }
+            .header h1 { margin: 0; font-size: 24px; }
+            .header span { color: var(--accent); font-size: 13px; font-weight: 600; }
             .grid {
                 display: grid;
                 grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -186,15 +169,10 @@ def dashboard():
             .card {
                 background: var(--card-bg);
                 padding: 20px;
-                border-radius: 12px;
-                box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
+                border-radius: 10px;
             }
-            .card h3 { margin: 0; font-size: 13px; color: var(--text-muted); text-transform: uppercase; }
-            .card .value { font-size: 28px; font-weight: bold; margin-top: 10px; }
-            .savings { color: var(--green); }
-            .hitl { color: var(--yellow); }
-            .security { color: var(--red); }
-            
+            .card h3 { margin: 0; font-size: 12px; color: var(--text-muted); text-transform: uppercase; }
+            .card .value { font-size: 26px; font-weight: 600; margin-top: 10px; }
             .main-content {
                 display: grid;
                 grid-template-columns: 1fr 1fr;
@@ -203,7 +181,7 @@ def dashboard():
             .panel {
                 background: var(--card-bg);
                 padding: 25px;
-                border-radius: 12px;
+                border-radius: 10px;
             }
             .panel h2 { margin-top: 0; font-size: 18px; margin-bottom: 20px; }
             input[type="text"] {
@@ -220,7 +198,7 @@ def dashboard():
             button {
                 background: var(--accent);
                 color: #0f172a;
-                font-weight: bold;
+                font-weight: 600;
                 border: none;
                 padding: 12px 20px;
                 border-radius: 8px;
@@ -228,7 +206,6 @@ def dashboard():
                 width: 100%;
                 font-size: 14px;
             }
-            button:hover { opacity: 0.9; }
             .response-box {
                 margin-top: 15px;
                 padding: 15px;
@@ -238,25 +215,11 @@ def dashboard():
                 font-size: 13px;
                 min-height: 80px;
                 white-space: pre-wrap;
-                word-break: break-all;
             }
-            table {
-                width: 100%;
-                border-collapse: collapse;
-                font-size: 13px;
-            }
-            th, td {
-                text-align: left;
-                padding: 10px;
-                border-bottom: 1px solid #334155;
-            }
+            table { width: 100%; border-collapse: collapse; font-size: 13px; }
+            th, td { text-align: left; padding: 10px; border-bottom: 1px solid #334155; }
             th { color: var(--text-muted); }
-            .badge {
-                padding: 4px 8px;
-                border-radius: 4px;
-                font-weight: bold;
-                font-size: 11px;
-            }
+            .badge { padding: 4px 8px; border-radius: 4px; font-weight: 600; font-size: 11px; }
             .badge-hit { background: rgba(34, 197, 94, 0.2); color: var(--green); }
             .badge-hitl { background: rgba(234, 179, 8, 0.2); color: var(--yellow); }
             .badge-miss { background: rgba(56, 189, 248, 0.2); color: var(--accent); }
@@ -266,10 +229,10 @@ def dashboard():
     <body>
         <div class="header">
             <div>
-                <h1>🛡️ SentinelFlow Gateway</h1>
-                <div style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">FinOps Semantic Cache & HITL Security Platform</div>
+                <h1>SentinelFlow Gateway</h1>
+                <div style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">FinOps Semantic Cache & Security Gateway</div>
             </div>
-            <span>● SISTEM AKTIF (v1.1)</span>
+            <span>v1.1.0</span>
         </div>
 
         <div class="grid">
@@ -278,104 +241,104 @@ def dashboard():
                 <div class="value" id="m-toplam">0</div>
             </div>
             <div class="card">
-                <h3>Cache Hit (Tasarruf)</h3>
+                <h3>Cache Hit</h3>
                 <div class="value" id="m-hit" style="color: var(--green);">0</div>
             </div>
             <div class="card">
-                <h3>LLM Çağrısı (Miss)</h3>
+                <h3>LLM Çağrısı</h3>
                 <div class="value" id="m-miss" style="color: var(--accent);">0</div>
             </div>
             <div class="card">
-                <h3>HITL Onay Kuyruğu</h3>
-                <div class="value hitl" id="m-hitl">0</div>
+                <h3>HITL Kuyruğu</h3>
+                <div class="value" id="m-hitl" style="color: var(--yellow);">0</div>
             </div>
             <div class="card">
-                <h3>Toplam FinOps Tasarrufu</h3>
-                <div class="value savings" id="m-tasarruf">$0.00</div>
+                <h3>FinOps Tasarrufu</h3>
+                <div class="value" id="m-tasarruf" style="color: var(--green);">$0.00</div>
             </div>
         </div>
 
         <div class="main-content">
             <div class="panel">
-                <h2>⚡ Gateway Test Paneli</h2>
-                <input type="text" id="soruInput" placeholder="Örn: Senelik tatil hakkım kaç gün? veya 75000 TL fatura onayı...">
-                <button onclick="istekGonder()">İstek Gönder</button>
+                <h2>Gateway Test Paneli</h2>
+                <input type="text" id="soruInput" placeholder="Örn: Senelik izin süresi kaç gündür? veya 75000 TL fatura onayı">
+                <button onclick="sendRequest()">İstek Gönder</button>
                 <div class="response-box" id="yanitKutusu">Yanıt bekleniyor...</div>
             </div>
 
             <div class="panel">
-                <h2>📋 Canlı İşlem ve Güvenlik Akışı</h2>
+                <h2>İşlem Geçmişi</h2>
                 <table>
                     <thead>
                         <tr>
                             <th>Sorgu</th>
-                            <th>İşlem Türü</th>
+                            <th>Tür</th>
                             <th>Maliyet</th>
                         </tr>
                     </thead>
                     <tbody id="gecmisTablosu">
-                        <tr><td colspan="3" style="text-align: center; color: var(--text-muted);">Henüz işlem yok</td></tr>
+                        <tr><td colspan="3" style="text-align: center; color: var(--text-muted);">İşlem kaydı yok</td></tr>
                     </tbody>
                 </table>
             </div>
         </div>
 
         <script>
-            async function verileriGuncelle() {
+            async function fetchMetrics() {
                 try {
                     const res = await fetch('/v1/metrics');
                     const data = await res.json();
                     
-                    document.getElementById('m-toplam').innerText = data.metrikler.toplam_istek;
-                    document.getElementById('m-hit').innerText = data.metrikler.onbellek_isabeti;
-                    document.getElementById('m-miss').innerText = data.metrikler.llm_yonlendirme;
-                    document.getElementById('m-hitl').innerText = data.metrikler.hitl_kuyrugu;
-                    document.getElementById('m-tasarruf').innerText = '$' + data.metrikler.toplam_tasarruf_dolar.toFixed(2);
+                    document.getElementById('m-toplam').innerText = data.metrics.total_requests;
+                    document.getElementById('m-hit').innerText = data.metrics.cache_hits;
+                    document.getElementById('m-miss').innerText = data.metrics.llm_routes;
+                    document.getElementById('m-hitl').innerText = data.metrics.hitl_queue;
+                    document.getElementById('m-tasarruf').innerText = '$' + data.metrics.total_savings_usd.toFixed(2);
 
                     const tbody = document.getElementById('gecmisTablosu');
-                    if (data.gecmis.length > 0) {
-                        tbody.innerHTML = data.gecmis.map(item => {
+                    if (data.audit_log.length > 0) {
+                        tbody.innerHTML = data.audit_log.map(item => {
                             let badgeClass = 'badge-miss';
-                            if (item.tur.includes('HIT')) badgeClass = 'badge-hit';
-                            if (item.tur.includes('HITL')) badgeClass = 'badge-hitl';
-                            if (item.tur.includes('GÜVENLİK')) badgeClass = 'badge-sec';
+                            if (item.type.includes('HIT')) badgeClass = 'badge-hit';
+                            if (item.type.includes('HITL')) badgeClass = 'badge-hitl';
+                            if (item.type.includes('GÜVENLİK')) badgeClass = 'badge-sec';
 
                             return `<tr>
-                                <td>${item.soru}</td>
-                                <td><span class="badge ${badgeClass}">${item.tur}</span></td>
-                                <td>${item.maliyet}</td>
+                                <td>${item.query}</td>
+                                <td><span class="badge ${badgeClass}">${item.type}</span></td>
+                                <td>${item.cost}</td>
                             </tr>`;
                         }).join('');
                     }
                 } catch (e) {
-                    console.error("Metrikler alınamadı", e);
+                    console.error("Metrikler okunamadı", e);
                 }
             }
 
-            async function istekGonder() {
-                const soru = document.getElementById('soruInput').value;
-                if (!soru) return;
+            async function sendRequest() {
+                const query = document.getElementById('soruInput').value;
+                if (!query) return;
 
-                const kutu = document.getElementById('yanitKutusu');
-                kutu.innerText = "İşleniyor...";
+                const box = document.getElementById('yanitKutusu');
+                box.innerText = "İşleniyor...";
 
                 try {
                     const res = await fetch('/v1/chat', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({soru: soru})
+                        body: JSON.stringify({soru: query})
                     });
                     const json = await res.json();
-                    kutu.innerText = JSON.stringify(json, null, 2);
+                    box.innerText = JSON.stringify(json, null, 2);
                 } catch (err) {
-                    kutu.innerText = "Hata veya Güvenlik Engeli tetiklendi!";
+                    box.innerText = "Hata veya güvenlik engeli!";
                 }
 
-                verileriGuncelle();
+                fetchMetrics();
             }
 
-            setInterval(verileriGuncelle, 2000);
-            verileriGuncelle();
+            setInterval(fetchMetrics, 2000);
+            fetchMetrics();
         </script>
     </body>
     </html>
@@ -383,4 +346,4 @@ def dashboard():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False)ss
